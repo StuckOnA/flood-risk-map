@@ -1,0 +1,8 @@
+streamlit>=1.30
+osmnx>=1.6
+networkx>=3.0
+folium>=0.15
+streamlit-folium>=0.15
+geopandas>=0.14
+shapely>=2.0
+pandas>=1.5

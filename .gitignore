@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Application caches / generated data
+cache/
+.flood_cache/
+*.json
+!requirements.txt
+!README.md
+
+# Backup / scratch files
+*.backup.py
+*.bak
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment / secrets
+.env
+.env.local
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Notebook / data artifacts
+*.ipynb_checkpoints/
+data/raw/
+data/processed/
