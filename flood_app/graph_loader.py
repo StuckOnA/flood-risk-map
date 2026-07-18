@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import networkx as nx
+import streamlit as st
 
 # Place + buffer_distance uniquely identify the dataset we want.
 PLACE_NAME = "Tangail, Bangladesh"
@@ -112,3 +113,14 @@ def load_tangail_graph(
         "path": str(path),
     }
     return G, info
+
+
+@st.cache_resource(show_spinner=False)
+def get_tangail_graph_cached() -> tuple[nx.MultiDiGraph, dict[str, Any]]:
+    """Streamlit-cached wrapper around :func:`load_tangail_graph`.
+
+    Memoises the graph across reruns (and across sessions sharing the
+    Streamlit script-run cache) so the ~50 ms pickle-read tax is paid
+    once per process instead of on every interaction.
+    """
+    return load_tangail_graph()

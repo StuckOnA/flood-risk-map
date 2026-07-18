@@ -114,11 +114,10 @@ def load_graph(graph_path: Path):
 
 
 def graph_exists(graph_path: Path) -> bool:
-    return graph_path.with_suffix(".pkl").exists() or graph_path.with_suffix(".graphml").exists()
-
-
-def graph_exists(graph_path: Path) -> bool:
-    return graph_path.exists()
+    return (
+        graph_path.with_suffix(".pkl").exists()
+        or graph_path.with_suffix(".graphml").exists()
+    )
 
 
 def save_flood_polylines(flood_path: Path, polylines: Iterable[tuple]) -> None:

@@ -92,6 +92,24 @@ def build_node_index(G: nx.MultiDiGraph) -> NodeIndex:
     return NodeIndex.build(G)
 
 
+# Streamlit-aware cached version: graphs aren't hashable, so we use the
+# leading-underscore convention to skip hashing and rely on object
+# identity. The caller is expected to pass the same graph instance on
+# every rerun (it comes from a cached resource).
+_NODE_INDEX_CACHE: dict[int, NodeIndex] = {}
+
+
+def get_node_index_cached(G: nx.MultiDiGraph) -> NodeIndex:
+    """Return a NodeIndex for ``G``, building it once per graph instance."""
+    key = id(G)
+    cached = _NODE_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    idx = build_node_index(G)
+    _NODE_INDEX_CACHE[key] = idx
+    return idx
+
+
 def nearest_node(G: nx.MultiDiGraph, index: NodeIndex, lat: float, lng: float) -> int:
     """Find the nearest node to (lat, lng). ``lat`` / ``lng`` are geographic."""
     graph_crs = G.graph.get("crs") if hasattr(G, "graph") else None

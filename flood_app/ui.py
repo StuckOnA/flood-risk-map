@@ -7,10 +7,9 @@ Layout:
     - Centre: Folium map with click-to-set support, color-coded road
       network, origin/destination markers, route polyline.
 
-We deliberately avoid ``st.rerun()`` — every Streamlit rerun already
-re-renders the whole page, so we just update ``session_state`` and let
-the next natural rerun pick up the changes. This is the single biggest
-perf fix over the previous version.
+We avoid ``st.rerun()`` for state updates fired by widget callbacks that
+re-fire every rerun (sliders, text inputs), but call it explicitly from
+``handle_map_click`` so the pin visibly moves on the same interaction.
 """
 
 from __future__ import annotations
@@ -25,9 +24,10 @@ from .flood import (
     FLOOD_STATES,
     prepare_flood_state,
 )
-from .graph_loader import PLACE_NAME, load_tangail_graph
+from .graph_loader import PLACE_NAME, get_tangail_graph_cached
 from .routing import (
     build_node_index,
+    get_node_index_cached,
     nearest_node,
     route_polyline,
     route_stats,
@@ -41,6 +41,17 @@ from .routing import (
 DEFAULT_ORIGIN = (24.2513, 89.9167)  # Tangail city center
 DEFAULT_DEST   = (24.2780, 89.9530)  # Tangail Sadar / east side
 MAP_HEIGHT     = 620
+
+# Route polyline color — a lighter, more translucent purple so the
+# underlying flood-coloured road network is still visible underneath.
+ROUTE_COLOR = "#a569bd"
+ROUTE_WEIGHT = 6
+ROUTE_OPACITY = 0.75
+
+# Pin-banner palette (border is the dark variant of the fill).
+PIN_ORIGIN_FILL,  PIN_ORIGIN_BORDER  = "#2ecc71", "#1e8449"
+PIN_DEST_FILL,    PIN_DEST_BORDER    = "#e74c3c", "#922b21"
+BANNER_HINT_ORIGIN, BANNER_HINT_NEXT, BANNER_HINT_DONE = "#1e8449", "#922b21", "#2c3e50"
 
 
 # ---------------------------------------------------------------------------
@@ -115,18 +126,42 @@ def parse_input(text: str, fallback: tuple[float, float]) -> tuple[float, float]
         return fallback
 
 
+def _resolve_endpoint(
+    text_value: str, click_key: str
+) -> tuple[float, float] | None:
+    """Resolve an endpoint from sidebar text or map-click coords.
+
+    Returns the typed coords when ``text_value`` is non-empty, else the
+    session_state click pin under ``click_key``. Returns None when
+    neither is set so the caller can render an un-pinned map.
+    """
+    if (text_value or "").strip():
+        typed = parse_input(text_value, None)
+        if typed is not None:
+            return typed
+    return st.session_state.get(click_key)
+
+
 def init_session_state() -> None:
-    """Initialise the keys we depend on, exactly once per session."""
+    """Initialise the keys we depend on, exactly once per session.
+
+    On launch, both click pins are unset so the user is prompted to
+    click the map to set Point A, then Point B. The ``text_input`` widgets
+    carry their own version counter (``origin_text_ver`` / ``dest_text_ver``)
+    so the Reset button — and a map click — can swap the widget to a
+    fresh key pre-populated with the new value, without touching the
+    widget-owned state Streamlit forbids us to mutate.
+    """
     defaults = {
-        "origin_text":     f"{DEFAULT_ORIGIN[0]}, {DEFAULT_ORIGIN[1]}",
-        "dest_text":       f"{DEFAULT_DEST[0]}, {DEFAULT_DEST[1]}",
-        "click_origin":    DEFAULT_ORIGIN,
-        "click_dest":      DEFAULT_DEST,
-        "click_phase":     "origin",     # next click sets origin/dest
-        "force_compute":   0,            # only the Compute button bumps this
-        "timing_log":      [],
-        "graph_info":      None,
-        "flood_info":      None,
+        "origin_text_ver":  0,
+        "dest_text_ver":    0,
+        "click_origin":     None,     # set by first map click
+        "click_dest":       None,     # set by second map click
+        "click_phase":      "origin", # next click sets origin/dest
+        "force_compute":    0,        # only the Compute button bumps this
+        "timing_log":       [],
+        "graph_info":       None,
+        "flood_info":       None,
         "node_index_built": False,
     }
     for key, value in defaults.items():
@@ -134,12 +169,24 @@ def init_session_state() -> None:
             st.session_state[key] = value
 
 
+def _set_widget_text(ver_key: str, widget_base: str, text: str) -> None:
+    """Swap the text_input at ``{widget_base}_v{ver_key}`` to show ``text``.
+
+    Bumps the version counter and pre-populates ``session_state`` with
+    the new key's *default* value. Streamlit treats that key as fresh
+    on the next render, so the widget re-mounts and displays ``text``
+    without raising StreamlitAPIException for mutating widget-owned state.
+    """
+    st.session_state[ver_key] += 1
+    ver = st.session_state[ver_key]
+    st.session_state[f"{widget_base}_v{ver}"] = text
+
+
 def push_timing(stage: str, ms: float, note: str = "") -> None:
     """Append a timing entry. Shown as a small table in the sidebar."""
     entry = {"stage": stage, "ms": round(ms, 1), "note": note}
     st.session_state.timing_log.append(entry)
     if len(st.session_state.timing_log) > 50:
-        # Keep the log bounded.
         st.session_state.timing_log = st.session_state.timing_log[-50:]
 
 
@@ -155,6 +202,55 @@ def make_status_logger(target) -> Callable[[str], None]:
         except Exception:
             pass
     return _log
+
+
+def _fmt_coord(point: tuple[float, float] | None) -> str:
+    """Format a (lat, lng) tuple for display, or '—' when None."""
+    if point is None:
+        return "—"
+    return f"{point[0]:.5f}, {point[1]:.5f}"
+
+
+def _render_pin_banner(
+    origin: tuple[float, float] | None,
+    destination: tuple[float, float] | None,
+) -> None:
+    """Render the click-prompt banner above the map.
+
+    Shows the current pin coordinates and what the next click will set.
+    """
+    if origin is None and destination is None:
+        hint = "👇 **Click on the map to set Point A (Origin).**"
+        hint_color = BANNER_HINT_ORIGIN
+    elif destination is None:
+        hint = "👇 **Now click to set Point B (Destination).**"
+        hint_color = BANNER_HINT_NEXT
+    else:
+        hint = "✅ Both pins are set. Adjust by clicking, or press **🚀 Compute Safe Route**."
+        hint_color = BANNER_HINT_DONE
+
+    pins_html = (
+        f'<span style="display:inline-flex;align-items:center;gap:6px;">'
+        f'<span style="display:inline-block;width:12px;height:12px;'
+        f'border-radius:50%;background:{PIN_ORIGIN_FILL};border:2px solid {PIN_ORIGIN_BORDER};"></span>'
+        f'<b>Origin:</b> {_fmt_coord(origin)}</span>'
+        f'<span style="display:inline-flex;align-items:center;gap:6px;">'
+        f'<span style="display:inline-block;width:12px;height:12px;'
+        f'border-radius:50%;background:{PIN_DEST_FILL};border:2px solid {PIN_DEST_BORDER};"></span>'
+        f'<b>Destination:</b> {_fmt_coord(destination)}</span>'
+    )
+
+    st.markdown(
+        f'<div style="border:1px solid #e1e4e8;border-left:5px solid {hint_color};'
+        f'border-radius:6px;padding:12px 16px;margin:4px 0 8px 0;background:#fff;'
+        f'box-shadow:0 1px 2px rgba(0,0,0,0.04);">'
+        f'<div style="font-weight:600;font-size:15px;color:{hint_color};'
+        f'margin-bottom:8px;">{hint}</div>'
+        f'<div style="display:flex;gap:24px;flex-wrap:wrap;font-size:13px;'
+        f'color:#333;font-family:monospace;">{pins_html}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -185,16 +281,26 @@ def render() -> None:
         st.header("🧭 Trip Planner")
 
         st.subheader("Origin")
+        # The widget key is versioned so a map click or Reset can give the
+        # input a fresh key (and thus a fresh value) without Streamlit
+        # complaining about us mutating widget-owned state. The ``value=``
+        # reads from the *new* key (pre-populated by _set_widget_text if
+        # a click just bumped the version), so the clicked coord appears
+        # in the sidebar on the same click.
+        _origin_ver = st.session_state.origin_text_ver
         origin_text = st.text_input(
             "Place name or coordinates (lat, lng)",
-            key="origin_text",
+            value=st.session_state.get(f"origin_text_v{_origin_ver}", ""),
+            key=f"origin_text_v{_origin_ver}",
             help="Paste 'lat, lng' or a place name. Click on the map to override.",
         )
 
         st.subheader("Destination")
+        _dest_ver = st.session_state.dest_text_ver
         dest_text = st.text_input(
             "Place name or coordinates (lat, lng)",
-            key="dest_text",
+            value=st.session_state.get(f"dest_text_v{_dest_ver}", ""),
+            key=f"dest_text_v{_dest_ver}",
             help="Paste 'lat, lng' or a place name. Click on the map to override.",
         )
 
@@ -207,7 +313,6 @@ def render() -> None:
             "♻️ Reset to defaults", use_container_width=True
         )
 
-        # Click-to-set hint
         next_phase = st.session_state.click_phase
         if next_phase == "origin":
             st.caption(
@@ -228,7 +333,7 @@ def render() -> None:
                     unsafe_allow_html=True,
                 )
             st.markdown(
-                "<span style='color:#5b2c6f;font-weight:600'>■</span> "
+                f"<span style='color:{ROUTE_COLOR};font-weight:600'>■</span> "
                 "**Route** — computed optimal safe route",
                 unsafe_allow_html=True,
             )
@@ -239,7 +344,6 @@ def render() -> None:
             if not log:
                 st.caption("No timings yet — interact with the app to populate.")
             else:
-                # Last 10 entries, newest first
                 for entry in reversed(log[-10:]):
                     ms = entry["ms"]
                     badge = (
@@ -266,61 +370,65 @@ def render() -> None:
                     f"({info_f['elapsed_ms']:.0f} ms)"
                 )
 
-    # --- Reset button --------------------------------------------------
     if reset_clicked:
-        st.session_state.origin_text = f"{DEFAULT_ORIGIN[0]}, {DEFAULT_ORIGIN[1]}"
-        st.session_state.dest_text   = f"{DEFAULT_DEST[0]}, {DEFAULT_DEST[1]}"
-        st.session_state.click_origin = DEFAULT_ORIGIN
-        st.session_state.click_dest   = DEFAULT_DEST
+        # Bump widget keys so the inputs re-render with empty values;
+        # we can't write widget-owned state directly — Streamlit raises
+        # StreamlitAPIException.
+        st.session_state.origin_text_ver += 1
+        st.session_state.dest_text_ver   += 1
+        st.session_state.click_origin = None
+        st.session_state.click_dest   = None
         st.session_state.click_phase  = "origin"
 
-    # --- Force recompute when the user explicitly clicks Compute -----
     if compute_clicked:
         st.session_state.force_compute += 1
 
-    # --- Parse origin / destination -----------------------------------
+    # Parse origin / destination. Typed text wins over click coords;
+    # otherwise pins default to None and we fall back to constants below
+    # just for map centering.
     import time
     t0 = time.perf_counter()
-    text_origin      = parse_input(st.session_state.origin_text, DEFAULT_ORIGIN)
-    text_destination = parse_input(st.session_state.dest_text,   DEFAULT_DEST)
-    origin      = st.session_state.click_origin    or text_origin
-    destination = st.session_state.click_dest      or text_destination
+    origin      = _resolve_endpoint(origin_text, "click_origin")
+    destination = _resolve_endpoint(dest_text,   "click_dest")
+    center_origin      = origin      or DEFAULT_ORIGIN
+    center_destination = destination or DEFAULT_DEST
     push_timing("parse inputs", (time.perf_counter() - t0) * 1000)
 
-    # --- Load graph (disk-cached) -------------------------------------
+    # Load graph (Streamlit resource-cached). First-launch spinners go
+    # in the sidebar where the user is looking; warm loads are silent.
     t0 = time.perf_counter()
-    if st.session_state.graph_info is None:
-        progress = st.sidebar.status(
+    needs_loading = st.session_state.graph_info is None
+    if needs_loading:
+        graph_spinner = st.sidebar.status(
             "🛰️  Fetching Tangail road network…", expanded=True
         )
-        log = make_status_logger(progress)
+        log = make_status_logger(graph_spinner)
     else:
-        progress = None
+        graph_spinner = None
         log = lambda _msg: None  # noqa: E731 — silent no-op logger
     try:
-        G, info = load_tangail_graph(_status=log)
+        G, info = get_tangail_graph_cached()
     finally:
-        if progress is not None:
-            progress.update(
+        if graph_spinner is not None:
+            graph_spinner.update(
                 label="Road network ready", state="complete", expanded=False
             )
-    st.session_state.graph_info = info
+    if st.session_state.graph_info is None:
+        st.session_state.graph_info = info
     push_timing(
         "load graph",
         (time.perf_counter() - t0) * 1000,
         "cache" if info["from_cache"] else "download",
     )
 
-    # --- Spatial index (built once per graph) -------------------------
-    cache_key = ("node_index_key", info.get("nodes"), info.get("edges"))
-    if st.session_state.get("node_index_key") != cache_key:
-        t0 = time.perf_counter()
-        st.session_state.node_index = build_node_index(G)
-        st.session_state.node_index_key = cache_key
+    # Spatial index (built once per graph instance).
+    t0 = time.perf_counter()
+    node_index = get_node_index_cached(G)
+    if not st.session_state.node_index_built:
+        st.session_state.node_index_built = True
         push_timing("build node index", (time.perf_counter() - t0) * 1000)
-    node_index = st.session_state.node_index
 
-    # --- Apply / load flood state --------------------------------------
+    # Apply / load flood state.
     t0 = time.perf_counter()
     edges_gdf, polylines, flood_info = prepare_flood_state(G, seed)
     st.session_state.flood_info = flood_info
@@ -330,39 +438,35 @@ def render() -> None:
         "cache" if flood_info["from_cache"] else "build",
     )
 
-    # --- Build folium map ---------------------------------------------
-    t0 = time.perf_counter()
-    m = build_map(origin, destination, polylines)
-    push_timing("build map object", (time.perf_counter() - t0) * 1000)
-
-    # --- Routing (cached by node-pair + seed) -------------------------
+    # Routing (cached by node-pair + seed).
     t0 = time.perf_counter()
     route_info, route_error = compute_route_cached(
         G, node_index, origin, destination, seed
     )
     push_timing("compute route", (time.perf_counter() - t0) * 1000)
 
-    # If we have a route, draw it on the map.
-    if route_info is not None:
-        folium.PolyLine(
-            locations=route_info["polyline"],
-            color="#5b2c6f",
-            weight=7,
-            opacity=0.95,
-            tooltip="Computed flood-safe route",
-        ).add_to(m)
+    # Build folium map.
+    t0 = time.perf_counter()
+    route_polyline = route_info["polyline"] if route_info is not None else None
+    m = build_map(
+        center_origin=center_origin,
+        center_destination=center_destination,
+        polylines=polylines,
+        origin=origin if origin is not None else None,
+        destination=destination if destination is not None else None,
+        route_polyline=route_polyline,
+    )
+    push_timing("build map object", (time.perf_counter() - t0) * 1000)
 
-    folium.LayerControl(collapsed=False).add_to(m)
-
-    # --- Render the map + process clicks ------------------------------
     st.markdown("### 🗺️ Map")
+    _render_pin_banner(origin, destination)
     map_data = st_folium(
         m, width=None, height=MAP_HEIGHT,
         returned_objects=["last_clicked"], key="flood_map",
     )
     handle_map_click(map_data)
 
-    # --- Stats / status ----------------------------------------------
+    # Stats / status.
     if route_info is not None:
         st.success("✅ Safe route found!")
         stats = route_info["stats"]
@@ -376,6 +480,14 @@ def render() -> None:
         )
     elif route_error is not None:
         st.error(route_error)
+    elif (
+        origin is None or destination is None
+    ) and st.session_state.get("force_compute", 0) > 0:
+        # User clicked Compute before setting both pins.
+        missing = "Point A (Origin)" if origin is None else "Point B (Destination)"
+        st.warning(
+            f"⚠️ Click on the map to set **{missing}** before computing a route."
+        )
 
     # --- Footer -------------------------------------------------------
     st.divider()
@@ -411,13 +523,23 @@ def render() -> None:
 # Map building
 # ---------------------------------------------------------------------------
 def build_map(
-    origin: tuple[float, float],
-    destination: tuple[float, float],
+    center_origin: tuple[float, float],
+    center_destination: tuple[float, float],
     polylines: list[tuple[str, list[list[float]]]],
+    origin: tuple[float, float] | None = None,
+    destination: tuple[float, float] | None = None,
+    route_polyline: list[list[float]] | None = None,
 ) -> folium.Map:
-    """Construct the Folium map: road network, origin/dest markers."""
-    center_lat = (origin[0] + destination[0]) / 2
-    center_lng = (origin[1] + destination[1]) / 2
+    """Construct the Folium map: road network, origin/dest markers, route.
+
+    ``center_origin`` and ``center_destination`` are always set — they're
+    used to compute the map's centre/zoom. The actual pin markers are
+    only drawn when ``origin`` / ``destination`` are not None, so a
+    fresh launch (no clicks yet) renders a clean map without markers.
+    ``route_polyline``, if set, is drawn on top of the road network.
+    """
+    center_lat = (center_origin[0] + center_destination[0]) / 2
+    center_lng = (center_origin[1] + center_destination[1]) / 2
     m = folium.Map(
         location=[center_lat, center_lng],
         zoom_start=13,
@@ -438,16 +560,28 @@ def build_map(
         ).add_to(road_layer)
     road_layer.add_to(m)
 
-    folium.Marker(
-        location=origin,
-        tooltip="Origin (A)",
-        icon=folium.Icon(color="green", icon="play", prefix="fa"),
-    ).add_to(m)
-    folium.Marker(
-        location=destination,
-        tooltip="Destination (B)",
-        icon=folium.Icon(color="red", icon="stop", prefix="fa"),
-    ).add_to(m)
+    if route_polyline:
+        folium.PolyLine(
+            locations=route_polyline,
+            color=ROUTE_COLOR,
+            weight=ROUTE_WEIGHT,
+            opacity=ROUTE_OPACITY,
+            tooltip="Computed flood-safe route",
+        ).add_to(m)
+
+    if origin is not None:
+        folium.Marker(
+            location=origin,
+            tooltip="Origin (A)",
+            icon=folium.Icon(color="green", icon="play", prefix="fa"),
+        ).add_to(m)
+    if destination is not None:
+        folium.Marker(
+            location=destination,
+            tooltip="Destination (B)",
+            icon=folium.Icon(color="red", icon="stop", prefix="fa"),
+        ).add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
     return m
 
 
@@ -462,9 +596,10 @@ def handle_map_click(map_data: dict | None) -> None:
     clicks keep toggling origin/dest. Clicks never trigger routing —
     only the "🚀 Compute Safe Route" button does.
 
-    After recording the click we call ``st.rerun()`` so the pin visibly
-    moves on the same interaction, instead of waiting for the next
-    rerun (which would feel like "the click did nothing").
+    We guard against ping-pong reruns: ``streamlit-folium`` re-emits the
+    last click on the rerun triggered by this handler, so without the
+    change-detection guard a single map click would flip origin→dest
+    and then immediately flip dest→origin on the auto-rerun.
     """
     if not map_data:
         return
@@ -476,12 +611,20 @@ def handle_map_click(map_data: dict | None) -> None:
     if lat is None or lng is None:
         return
 
+    clicked = (lat, lng)
+    coord_text = f"{lat:.6f}, {lng:.6f}"
     if st.session_state.click_phase == "origin":
-        st.session_state.click_origin = (lat, lng)
+        if st.session_state.click_origin == clicked:
+            return
+        st.session_state.click_origin = clicked
         st.session_state.click_phase = "dest"
+        _set_widget_text("origin_text_ver", "origin_text", coord_text)
     else:
-        st.session_state.click_dest = (lat, lng)
+        if st.session_state.click_dest == clicked:
+            return
+        st.session_state.click_dest = clicked
         st.session_state.click_phase = "origin"
+        _set_widget_text("dest_text_ver", "dest_text", coord_text)
 
     st.rerun()
 
@@ -492,7 +635,7 @@ def handle_map_click(map_data: dict | None) -> None:
 def compute_route_cached(
     G, node_index, origin, destination, seed
 ):
-    """Compute a route, caching by (origin_node, dest_node, seed, force_compute).
+    """Compute a route, caching by (origin_node, dest_node, seed).
 
     Only runs when the user has clicked "🚀 Compute Safe Route", which
     bumps ``force_compute``. Every other interaction (text edits, map
@@ -513,7 +656,9 @@ def compute_route_cached(
     d_node = nearest_node(G, node_index, destination[0], destination[1])
     push_timing("nearest_node (×2)", (time.perf_counter() - t0) * 1000)
 
-    cache_key = ("route", seed, force, o_node, d_node)
+    # Cache key excludes ``force`` so repeat Compute clicks with the same
+    # (seed, origin, destination) skip shortest_path entirely.
+    cache_key = ("route", seed, o_node, d_node)
     if cache_key in st.session_state:
         cached = st.session_state[cache_key]
         if isinstance(cached, dict) and "error" in cached:

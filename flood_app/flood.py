@@ -16,6 +16,7 @@ build_flood_polylines(graph, edges, status=None) -> list[(color, coords)]
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass
 from typing import Callable, Iterable
 
 import geopandas as gpd
@@ -30,6 +31,22 @@ FLOOD_STATES = {
     "Caution":    {"prob": 0.20, "multiplier": 2.0,    "color": "#f39c12"},  # orange
     "Impassable": {"prob": 0.10, "multiplier": 999999, "color": "#e74c3c"},  # red
 }
+
+
+@dataclass
+class _FloodCache:
+    """In-memory cache of the last-applied flood dataset.
+
+    Repeated reruns with the same seed skip pickle reads AND the
+    write_weights_back_to_graph loop (~19k edge iterations).
+    """
+
+    seed:      int | None = None
+    edges:     gpd.GeoDataFrame | None = None
+    polylines: list[tuple[str, list[list[float]]]] | None = None
+
+
+_FLOOD_CACHE = _FloodCache()
 
 
 def assign_flood_states(edges: gpd.GeoDataFrame, seed: int) -> gpd.GeoDataFrame:
@@ -129,6 +146,9 @@ def build_flood_polylines(
     return polylines
 
 
+# Module-level in-memory cache. See :class:`_FloodCache` above.
+
+
 def prepare_flood_state(
     G: nx.MultiDiGraph,
     seed: int,
@@ -136,13 +156,32 @@ def prepare_flood_state(
 ) -> tuple[gpd.GeoDataFrame, list[tuple[str, list[list[float]]]], dict]:
     """Load the flood dataset for ``seed``, returning (edges, polylines, info).
 
-    Both the polylines and the edges GeoDataFrame are disk-cached per
-    (place, seed) so a warm load is just two pickle/JSON reads — no
-    reprojection, no random assignment.
+    Caches at three layers:
+      1. Module-level memory for the same seed in the same session.
+      2. Disk pickle for cold starts.
+      3. Re-projection + random assignment only on a true cache miss.
     """
     import time
-
     started = time.perf_counter()
+
+    # Layer 1: in-memory hit. Skip pickle reads + the write_weights loop.
+    if (
+        seed == _FLOOD_CACHE.seed
+        and _FLOOD_CACHE.edges is not None
+        and _FLOOD_CACHE.polylines is not None
+    ):
+        return (
+            _FLOOD_CACHE.edges,
+            _FLOOD_CACHE.polylines,
+            {
+                "from_cache": True,
+                "elapsed_ms": (time.perf_counter() - started) * 1000,
+                "seed": seed,
+                "polylines": len(_FLOOD_CACHE.polylines),
+                "path": "<memory>",
+            },
+        )
+
     path = cache_io.flood_path(PLACE_NAME, seed)
     has_polylines = cache_io.flood_exists(path)
     has_edges     = cache_io.flood_edges_exist(path)
@@ -175,6 +214,10 @@ def prepare_flood_state(
             if status:
                 status(f"⚠️ Could not persist flood edges: {exc}")
         from_cache = False
+
+    _FLOOD_CACHE.seed = seed
+    _FLOOD_CACHE.edges = edges
+    _FLOOD_CACHE.polylines = polylines
 
     elapsed_ms = (time.perf_counter() - started) * 1000
     info = {

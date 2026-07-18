@@ -26,6 +26,7 @@ cache/
 # Backup / scratch files
 *.backup.py
 *.bak
+backups/
 
 # IDE / editor
 .vscode/
