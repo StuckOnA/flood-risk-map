@@ -82,20 +82,35 @@ a.leaflet-pm-icon, .leaflet-pm-icon,
 # Helpers
 # ---------------------------------------------------------------------------
 def parse_input(text: str, fallback: tuple[float, float]) -> tuple[float, float]:
-    """Parse 'lat, lng' or fall back to OSM geocoding, then to fallback."""
+    """Parse 'lat, lng' or fall back to OSM geocoding, then to fallback.
+
+    Cached by the input text in ``session_state.parse_cache`` so repeat
+    reruns with the same sidebar text skip both the split-parse and any
+    network geocode call.
+    """
     import osmnx as ox
 
     text = (text or "").strip()
     if not text:
         return fallback
+
+    cache = st.session_state.setdefault("parse_cache", {})
+    if text in cache:
+        return cache[text]
+
+    result = fallback
     try:
         parts = [p.strip() for p in text.split(",")]
         if len(parts) == 2:
-            return (float(parts[0]), float(parts[1]))
+            result = (float(parts[0]), float(parts[1]))
+            cache[text] = result
+            return result
     except ValueError:
         pass
     try:
-        return tuple(ox.geocode(text))  # type: ignore[return-value]
+        result = tuple(ox.geocode(text))  # type: ignore[return-value]
+        cache[text] = result
+        return result
     except Exception:
         return fallback
 
@@ -108,9 +123,7 @@ def init_session_state() -> None:
         "click_origin":    DEFAULT_ORIGIN,
         "click_dest":      DEFAULT_DEST,
         "click_phase":     "origin",     # next click sets origin/dest
-        "last_click_sig":  None,
-        "auto_route":      True,         # auto-route when both clicks exist
-        "force_compute":   0,            # bump to force recomputation
+        "force_compute":   0,            # only the Compute button bumps this
         "timing_log":      [],
         "graph_info":      None,
         "flood_info":      None,
@@ -260,9 +273,6 @@ def render() -> None:
         st.session_state.click_origin = DEFAULT_ORIGIN
         st.session_state.click_dest   = DEFAULT_DEST
         st.session_state.click_phase  = "origin"
-        st.session_state.last_click_sig = None
-        st.session_state.auto_route   = True
-        st.session_state.force_compute += 1
 
     # --- Force recompute when the user explicitly clicks Compute -----
     if compute_clicked:
@@ -279,14 +289,21 @@ def render() -> None:
 
     # --- Load graph (disk-cached) -------------------------------------
     t0 = time.perf_counter()
-    progress = st.sidebar.status(
-        "🛰️  Fetching Tangail road network…", expanded=True
-    )
-    log = make_status_logger(progress)
+    if st.session_state.graph_info is None:
+        progress = st.sidebar.status(
+            "🛰️  Fetching Tangail road network…", expanded=True
+        )
+        log = make_status_logger(progress)
+    else:
+        progress = None
+        log = lambda _msg: None  # noqa: E731 — silent no-op logger
     try:
         G, info = load_tangail_graph(_status=log)
     finally:
-        progress.update(label="Road network ready", state="complete", expanded=False)
+        if progress is not None:
+            progress.update(
+                label="Road network ready", state="complete", expanded=False
+            )
     st.session_state.graph_info = info
     push_timing(
         "load graph",
@@ -294,10 +311,14 @@ def render() -> None:
         "cache" if info["from_cache"] else "download",
     )
 
-    # --- Build spatial index for nearest-node (once per graph) --------
-    t0 = time.perf_counter()
-    node_index = build_node_index(G)
-    push_timing("build node index", (time.perf_counter() - t0) * 1000)
+    # --- Spatial index (built once per graph) -------------------------
+    cache_key = ("node_index_key", info.get("nodes"), info.get("edges"))
+    if st.session_state.get("node_index_key") != cache_key:
+        t0 = time.perf_counter()
+        st.session_state.node_index = build_node_index(G)
+        st.session_state.node_index_key = cache_key
+        push_timing("build node index", (time.perf_counter() - t0) * 1000)
+    node_index = st.session_state.node_index
 
     # --- Apply / load flood state --------------------------------------
     t0 = time.perf_counter()
@@ -404,10 +425,16 @@ def build_map(
         control_scale=True,
     )
     road_layer = folium.FeatureGroup(name="Road network (flood state)", show=True)
+    # Batch all road segments per color into a single PolyLine. Going from
+    # ~19k PolyLine objects to 3 (one per flood state color) is the
+    # single biggest hot-path win: each PolyLine adds DOM nodes and JS
+    # event handlers on the client side, so the cost is not just Python.
+    by_color: dict[str, list[list[list[float]]]] = {}
     for color, coords in polylines:
-        # ``coords`` is [[lat, lng], ...]
+        by_color.setdefault(color, []).append(coords)
+    for color, segments in by_color.items():
         folium.PolyLine(
-            locations=coords, color=color, weight=2, opacity=0.75,
+            locations=segments, color=color, weight=2, opacity=0.75,
         ).add_to(road_layer)
     road_layer.add_to(m)
 
@@ -430,9 +457,14 @@ def build_map(
 def handle_map_click(map_data: dict | None) -> None:
     """Update click_origin / click_dest in session_state from a map click.
 
-    No ``st.rerun()`` here — the natural rerun on next interaction picks
-    up the new state. We detect a *new* click by hashing the click coords
-    and comparing to the last one we processed.
+    The first click sets the origin and flips the phase to ``"dest"``;
+    the second click sets the destination and flips it back. Subsequent
+    clicks keep toggling origin/dest. Clicks never trigger routing —
+    only the "🚀 Compute Safe Route" button does.
+
+    After recording the click we call ``st.rerun()`` so the pin visibly
+    moves on the same interaction, instead of waiting for the next
+    rerun (which would feel like "the click did nothing").
     """
     if not map_data:
         return
@@ -444,20 +476,14 @@ def handle_map_click(map_data: dict | None) -> None:
     if lat is None or lng is None:
         return
 
-    sig = (round(lat, 6), round(lng, 6))
-    if sig == st.session_state.last_click_sig:
-        return  # Same click as last time — no-op
-    st.session_state.last_click_sig = sig
-
     if st.session_state.click_phase == "origin":
         st.session_state.click_origin = (lat, lng)
-        st.session_state.click_dest = None  # force re-pick
         st.session_state.click_phase = "dest"
-        st.session_state.auto_route = False  # wait for second click
     else:
         st.session_state.click_dest = (lat, lng)
         st.session_state.click_phase = "origin"
-        st.session_state.auto_route = True   # compute immediately
+
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -466,17 +492,20 @@ def handle_map_click(map_data: dict | None) -> None:
 def compute_route_cached(
     G, node_index, origin, destination, seed
 ):
-    """Compute a route, caching by (origin_node, dest_node, seed, force_compute)."""
-    import time
+    """Compute a route, caching by (origin_node, dest_node, seed, force_compute).
 
-    force = st.session_state.get("force_compute", 0)
+    Only runs when the user has clicked "🚀 Compute Safe Route", which
+    bumps ``force_compute``. Every other interaction (text edits, map
+    clicks, seed changes, Reset) leaves force at 0 and produces no route.
+    """
+    import time
 
     # Skip if both points haven't been set yet.
     if origin is None or destination is None:
         return None, None
 
-    auto_route = st.session_state.get("auto_route", False)
-    if not auto_route and force == 0:
+    force = st.session_state.get("force_compute", 0)
+    if force == 0:
         return None, None
 
     t0 = time.perf_counter()
@@ -497,9 +526,6 @@ def compute_route_cached(
         stats = route_stats(G, route_edges)
         result = {"polyline": polyline, "stats": stats}
         st.session_state[cache_key] = result
-        # Once we've successfully routed, the user has to explicitly click
-        # Compute again to re-route.
-        st.session_state.auto_route = False
         return result, None
     except Exception as exc:
         import networkx as nx
